@@ -15,8 +15,8 @@ package com.github.shyiko.mysql.binlog.event.deserialization.json;
 
 import java.io.IOException;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.testng.Assert;
+import org.testng.annotations.Test;
 
 /**
  * The column value
@@ -43,7 +43,7 @@ import org.junit.Test;
  * <pre>
  * JSON_REMOVE(custom_fields, '$.\"17fc9889474028063990914001f6854f6b8b5784\"')
  * </pre>
- * MySQL 5.7 and MySQL 8.0 emits different values in binlog (MySQL 8 value is sparse and requires strict using of offsets) 
+ * MySQL 5.7 and MySQL 8.0 emits different values in binlog (MySQL 8 value is sparse and requires strict using of offsets)
  */
 public class JsonPartialUpdateParseTest {
 

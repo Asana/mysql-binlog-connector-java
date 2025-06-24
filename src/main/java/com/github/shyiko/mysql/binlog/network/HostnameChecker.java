@@ -70,7 +70,7 @@ import java.util.logging.Logger;
  * javax.net.ssl.HostnameVerifier, but that interface is not recommended.
  * Instead we added several check() methods that take SSLSocket,
  * or X509Certificate, or ultimately (they all end up calling this one),
- * String.  (It's easier to supply JUnit with Strings instead of mock
+ * String.  (It's easier to supply JUnit/TestNG with Strings instead of mock
  * SSLSession objects!)
  * <p>Our check() methods throw exceptions if the name is
  * invalid, whereas javax.net.ssl.HostnameVerifier just returns true/false.
