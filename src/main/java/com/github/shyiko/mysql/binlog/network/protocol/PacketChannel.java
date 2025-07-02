@@ -26,16 +26,20 @@ import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLSocket;
 import java.io.IOException;
 import java.net.Socket;
+import java.net.SocketException;
 import java.nio.channels.Channel;
 
 /**
  * @author <a href="mailto:stanley.shyiko@gmail.com">Stanley Shyiko</a>
  */
 public class PacketChannel implements Channel {
-
+    private int packetNumber = 0;
+    private boolean authenticationComplete;
+    private boolean isSSL = false;
     private Socket socket;
     private ByteArrayInputStream inputStream;
     private ByteArrayOutputStream outputStream;
+    private boolean shouldUseSoLinger0 = false;
 
     public PacketChannel(String hostname, int port) throws IOException {
         this(new Socket(hostname, port));
@@ -55,24 +59,38 @@ public class PacketChannel implements Channel {
         return outputStream;
     }
 
+    public void authenticationComplete() {
+        authenticationComplete = true;
+    }
+
     public byte[] read() throws IOException {
         int length = inputStream.readInteger(3);
-        inputStream.skip(1); //sequence
+        int sequence = inputStream.read(); // sequence
+        if ( sequence != packetNumber++ ) {
+            throw new IOException("unexpected sequence #" + sequence);
+        }
         return inputStream.read(length);
     }
 
-    public void write(Command command, int packetNumber) throws IOException {
+    public void write(Command command) throws IOException {
         byte[] body = command.toByteArray();
-        outputStream.writeInteger(body.length, 3); // packet length
-        outputStream.writeInteger(packetNumber, 1);
-        outputStream.write(body, 0, body.length);
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        buffer.writeInteger(body.length, 3); // packet length
+
+        // see https://dev.mysql.com/doc/dev/mysql-server/8.0.11/page_protocol_basic_packets.html#sect_protocol_basic_packets_sequence_id
+        // we only have to maintain a sequence number in the authentication phase.
+        // what the point is, I do not know
+        if ( authenticationComplete ) {
+            packetNumber = 0;
+        }
+
+        buffer.writeInteger(packetNumber++, 1);
+
+        buffer.write(body, 0, body.length);
+        outputStream.write(buffer.toByteArray());
         // though it has no effect in case of default (underlying) output stream (SocketOutputStream),
         // it may be necessary in case of non-default one
         outputStream.flush();
-    }
-
-    public void write(Command command) throws IOException {
-        write(command, 0);
     }
 
     public void upgradeToSSL(SSLSocketFactory sslSocketFactory, HostnameVerifier hostnameVerifier) throws IOException {
@@ -86,6 +104,15 @@ public class PacketChannel implements Channel {
             throw new IdentityVerificationException("\"" + sslSocket.getInetAddress().getHostName() +
                 "\" identity was not confirmed");
         }
+        isSSL = true;
+    }
+
+    public boolean isSSL() {
+        return isSSL;
+    }
+
+    public void setShouldUseSoLinger0() {
+        shouldUseSoLinger0 = true;
     }
 
     @Override
@@ -95,6 +122,13 @@ public class PacketChannel implements Channel {
 
     @Override
     public void close() throws IOException {
+        if (shouldUseSoLinger0) {
+            try {
+                socket.setSoLinger(true, 0);
+            } catch (SocketException e) {
+                // ignore
+            }
+        }
         try {
             socket.shutdownInput(); // for socketInputStream.setEOF(true)
         } catch (Exception e) {
@@ -106,5 +140,6 @@ public class PacketChannel implements Channel {
             // ignore
         }
         socket.close();
+        shouldUseSoLinger0 = false;
     }
 }

@@ -80,8 +80,6 @@ import java.nio.charset.Charset;
  * <h2>Grammar</h2>
  * The grammar of the binary representation of JSON objects are defined in the MySQL codebase in the
  * <a href="https://github.com/mysql/mysql-server/blob/5.7/sql/json_binary.h">json_binary.h</a> file:
- * <p>
- *
  * <pre>
  *   doc ::= type value
  *   type ::=
@@ -164,11 +162,21 @@ public class JsonBinary {
      * @throws IOException if there is a problem reading or processing the binary representation
      */
     public static String parseAsString(byte[] bytes) throws IOException {
+        /* check for mariaDB-format JSON strings inside columns marked JSON */
+        if ( isJSONString(bytes) ) {
+            return new String(bytes);
+        }
         JsonStringFormatter handler = new JsonStringFormatter();
         parse(bytes, handler);
         return handler.getString();
     }
 
+    private static boolean isJSONString(byte[] bytes) {
+        if (bytes[0] > 0x0f)
+            return true;
+        else
+            return false;
+    }
     /**
      * Parse the MySQL binary representation of a {@code JSON} value and call the supplied {@link JsonFormatter}
      * for the various components of the value.
@@ -189,6 +197,7 @@ public class JsonBinary {
 
     public JsonBinary(ByteArrayInputStream contents) {
         this.reader = contents;
+        this.reader.mark(Integer.MAX_VALUE);
     }
 
     public String getString() {
@@ -262,8 +271,6 @@ public class JsonBinary {
      * <a href="https://github.com/mysql/mysql-server/blob/5.7/sql/json_binary.h">json_binary.h</a> file:
      * <h3>Grammar</h3>
      *
-     * <h3>Grammar</h3>
-     *
      * <pre>
      *   value ::=
      *       object  |
@@ -319,16 +326,21 @@ public class JsonBinary {
      */
     protected void parseObject(boolean small, JsonFormatter formatter)
             throws IOException {
+        // this is terrible, but without a decent seekable InputStream the other way seemed like
+        // a full-on rewrite
+        int objectOffset = this.reader.getPosition();
+
         // Read the header ...
         int numElements = readUnsignedIndex(Integer.MAX_VALUE, small, "number of elements in");
         int numBytes = readUnsignedIndex(Integer.MAX_VALUE, small, "size of");
         int valueSize = small ? 2 : 4;
 
         // Read each key-entry, consisting of the offset and length of each key ...
-        int[] keyLengths = new int[numElements];
+        KeyEntry[] keys = new KeyEntry[numElements];
         for (int i = 0; i != numElements; ++i) {
-            readUnsignedIndex(numBytes, small, "key offset in"); // unused
-            keyLengths[i] = readUInt16();
+            keys[i] = new KeyEntry(
+                    readUnsignedIndex(numBytes, small, "key offset in"),
+                    readUInt16());
         }
 
         // Read each key value value-entry
@@ -373,9 +385,14 @@ public class JsonBinary {
         }
 
         // Read each key ...
-        String[] keys = new String[numElements];
         for (int i = 0; i != numElements; ++i) {
-            keys[i] = reader.readString(keyLengths[i]);
+            final int skipBytes = keys[i].index + objectOffset - reader.getPosition();
+            // Skip to a start of a field name if the current position does not point to it
+            // This can happen for MySQL 8
+            if (skipBytes != 0) {
+                reader.fastSkip(skipBytes);
+            }
+            keys[i].name = reader.readString(keys[i].length);
         }
 
         // Now parse the values ...
@@ -384,7 +401,7 @@ public class JsonBinary {
             if (i != 0) {
                 formatter.nextEntry();
             }
-            formatter.name(keys[i]);
+            formatter.name(keys[i].name);
             ValueEntry entry = entries[i];
             if (entry.resolved) {
                 Object value = entry.value;
@@ -397,6 +414,8 @@ public class JsonBinary {
                 }
             } else {
                 // Parse the value ...
+                this.reader.reset();
+                this.reader.fastSkip(objectOffset + entry.index);
                 parse(entry.type, formatter);
             }
         }
@@ -463,6 +482,8 @@ public class JsonBinary {
     // checkstyle, please ignore MethodLength for the next line
     protected void parseArray(boolean small, JsonFormatter formatter)
             throws IOException {
+        int arrayOffset = this.reader.getPosition();
+
         // Read the header ...
         int numElements = readUnsignedIndex(Integer.MAX_VALUE, small, "number of elements in");
         int numBytes = readUnsignedIndex(Integer.MAX_VALUE, small, "size of");
@@ -527,6 +548,9 @@ public class JsonBinary {
                 }
             } else {
                 // Parse the value ...
+                this.reader.reset();
+                this.reader.fastSkip(arrayOffset + entry.index);
+
                 parse(entry.type, formatter);
             }
         }
@@ -650,7 +674,6 @@ public class JsonBinary {
      * See the <a href=
      * "https://github.com/mysql/mysql-server/blob/e0e0ae2ea27c9bb76577664845507ef224d362e4/sql/json_binary.cc#L1034">
      * MySQL source code</a> for the logic used in this method.
-     * <p>
      * <h3>Grammar</h3>
      *
      * <pre>
@@ -946,6 +969,7 @@ public class JsonBinary {
      * to 16383, and so on...
      *
      * @return the integer value
+	 * @throws IOException if we don't encounter an end-of-int marker
      */
     protected int readVariableInt() throws IOException {
         int length = 0;
@@ -986,6 +1010,26 @@ public class JsonBinary {
 
     protected static String asHex(int value) {
         return Integer.toHexString(value);
+    }
+
+    /**
+     * Class used internally to hold key entry information.
+     */
+    protected static final class KeyEntry {
+
+        protected final int index;
+        protected final int length;
+        protected String name;
+
+        public KeyEntry(int index, int length) {
+            this.index = index;
+            this.length = length;
+        }
+
+        public KeyEntry setKey(String key) {
+            this.name = key;
+            return this;
+        }
     }
 
     /**

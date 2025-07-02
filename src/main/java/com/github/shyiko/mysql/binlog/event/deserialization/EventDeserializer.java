@@ -20,7 +20,9 @@ import com.github.shyiko.mysql.binlog.event.EventData;
 import com.github.shyiko.mysql.binlog.event.EventHeader;
 import com.github.shyiko.mysql.binlog.event.EventType;
 import com.github.shyiko.mysql.binlog.event.FormatDescriptionEventData;
+import com.github.shyiko.mysql.binlog.event.LRUCache;
 import com.github.shyiko.mysql.binlog.event.TableMapEventData;
+import com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData;
 import com.github.shyiko.mysql.binlog.io.ByteArrayInputStream;
 
 import java.io.IOException;
@@ -44,6 +46,7 @@ public class EventDeserializer {
     private final Map<Long, TableMapEventData> tableMapEventByTableId;
 
     private EventDataDeserializer tableMapEventDataDeserializer;
+    private EventDataDeserializer formatDescEventDataDeserializer;
 
     public EventDeserializer() {
         this(new EventHeaderV4Deserializer(), new NullEventDataDeserializer());
@@ -64,7 +67,7 @@ public class EventDeserializer {
         this.eventHeaderDeserializer = eventHeaderDeserializer;
         this.defaultEventDataDeserializer = defaultEventDataDeserializer;
         this.eventDataDeserializers = new IdentityHashMap<EventType, EventDataDeserializer>();
-        this.tableMapEventByTableId = new HashMap<Long, TableMapEventData>();
+        this.tableMapEventByTableId = new LRUCache<>(100, 0.75f, 10000);
         registerDefaultEventDataDeserializers();
         afterEventDataDeserializerSet(null);
     }
@@ -118,6 +121,16 @@ public class EventDeserializer {
                new PreviousGtidSetDeserializer());
         eventDataDeserializers.put(EventType.XA_PREPARE,
                 new XAPrepareEventDataDeserializer());
+        eventDataDeserializers.put(EventType.ANNOTATE_ROWS,
+            new AnnotateRowsEventDataDeserializer());
+        eventDataDeserializers.put(EventType.MARIADB_GTID,
+            new MariadbGtidEventDataDeserializer());
+        eventDataDeserializers.put(EventType.BINLOG_CHECKPOINT,
+            new BinlogCheckpointEventDataDeserializer());
+        eventDataDeserializers.put(EventType.MARIADB_GTID_LIST,
+            new MariadbGtidListEventDataDeserializer());
+        eventDataDeserializers.put(EventType.TRANSACTION_PAYLOAD,
+                new TransactionPayloadEventDataDeserializer());
     }
 
     public void setEventDataDeserializer(EventType eventType, EventDataDeserializer eventDataDeserializer) {
@@ -137,14 +150,31 @@ public class EventDeserializer {
                 tableMapEventDataDeserializer = null;
             }
         }
+        if (eventType == null || eventType == EventType.FORMAT_DESCRIPTION) {
+            EventDataDeserializer eventDataDeserializer = getEventDataDeserializer(EventType.FORMAT_DESCRIPTION);
+            if (eventDataDeserializer.getClass() != FormatDescriptionEventDataDeserializer.class &&
+                eventDataDeserializer.getClass() != EventDataWrapper.Deserializer.class) {
+                formatDescEventDataDeserializer = new EventDataWrapper.Deserializer(
+                    new FormatDescriptionEventDataDeserializer(), eventDataDeserializer);
+            } else {
+                formatDescEventDataDeserializer = null;
+            }
+        }
     }
 
+    /**
+     * @deprecated resolved based on FORMAT_DESCRIPTION
+	 * @param checksumType don't use this function.
+     */
+    @Deprecated
     public void setChecksumType(ChecksumType checksumType) {
         this.checksumLength = checksumType.getLength();
     }
 
     /**
      * @see CompatibilityMode
+	 * @param first at least one CompatabilityMode
+	 * @param rest many modes
      */
     public void setCompatibilityMode(CompatibilityMode first, CompatibilityMode... rest) {
         this.compatibilitySet = EnumSet.of(first, rest);
@@ -184,46 +214,117 @@ public class EventDeserializer {
             deserializer.setDeserializeCharAndBinaryAsByteArray(
                 compatibilitySet.contains(CompatibilityMode.CHAR_AND_BINARY_AS_BYTE_ARRAY)
             );
+            deserializer.setDeserializeIntegerAsByteArray(
+                compatibilitySet.contains(CompatibilityMode.INTEGER_AS_BYTE_ARRAY)
+            );
         }
     }
 
     /**
      * @return deserialized event or null in case of end-of-stream
+	 * @param inputStream input stream to fetch event from
+	 * @throws IOException if connection gets closed
      */
     public Event nextEvent(ByteArrayInputStream inputStream) throws IOException {
         if (inputStream.peek() == -1) {
             return null;
         }
         EventHeader eventHeader = eventHeaderDeserializer.deserialize(inputStream);
-        EventDataDeserializer eventDataDeserializer = getEventDataDeserializer(eventHeader.getEventType());
-        if (eventHeader.getEventType() == EventType.FORMAT_DESCRIPTION) {
-            eventDataDeserializer = new FormatDescriptionEventDataDeserializer();
-            setChecksumType(ChecksumType.NONE);
-        } else if (eventHeader.getEventType() == EventType.TABLE_MAP && tableMapEventDataDeserializer != null) {
-            eventDataDeserializer = tableMapEventDataDeserializer;
-        }
-        EventData eventData = deserializeEventData(inputStream, eventHeader, eventDataDeserializer);
-        if (eventHeader.getEventType() == EventType.FORMAT_DESCRIPTION) {
-            // 1 byte means checksum algo, 4 byte is crc checksum content
-            if (((FormatDescriptionEventData) eventData).getEventLength() + 1 + 4 == eventHeader.getDataLength()) {
-                setChecksumType(ChecksumType.CRC32);
-            } else {
-                setChecksumType(ChecksumType.NONE);
-            }
-        } else if (eventHeader.getEventType() == EventType.TABLE_MAP) {
-            TableMapEventData tableMapEvent;
-            if (eventData instanceof EventDataWrapper) {
-                EventDataWrapper eventDataWrapper = (EventDataWrapper) eventData;
-                tableMapEvent = (TableMapEventData) eventDataWrapper.getInternal();
-                if (tableMapEventDataDeserializer != null) {
-                    eventData = eventDataWrapper.getExternal();
-                }
-            } else {
-                tableMapEvent = (TableMapEventData) eventData;
-            }
-            tableMapEventByTableId.put(tableMapEvent.getTableId(), tableMapEvent);
+        EventData eventData;
+        switch (eventHeader.getEventType()) {
+            case FORMAT_DESCRIPTION:
+                eventData = deserializeFormatDescriptionEventData(inputStream, eventHeader);
+                break;
+            case TABLE_MAP:
+                eventData = deserializeTableMapEventData(inputStream, eventHeader);
+                break;
+            case TRANSACTION_PAYLOAD:
+                eventData = deserializeTransactionPayloadEventData(inputStream, eventHeader);
+                break;
+            default:
+                EventDataDeserializer eventDataDeserializer = getEventDataDeserializer(eventHeader.getEventType());
+                eventData = deserializeEventData(inputStream, eventHeader, eventDataDeserializer);
         }
         return new Event(eventHeader, eventData);
+    }
+
+    private EventData deserializeFormatDescriptionEventData(ByteArrayInputStream inputStream, EventHeader eventHeader)
+            throws EventDataDeserializationException {
+        EventDataDeserializer eventDataDeserializer =
+            formatDescEventDataDeserializer != null ?
+                formatDescEventDataDeserializer :
+                getEventDataDeserializer(EventType.FORMAT_DESCRIPTION);
+        int eventBodyLength = (int) eventHeader.getDataLength();
+        EventData eventData;
+        try {
+            inputStream.enterBlock(eventBodyLength);
+            try {
+                eventData = eventDataDeserializer.deserialize(inputStream);
+                // https://dev.mysql.com/worklog/task/?id=2540#tabs-2540-4
+                // +-----------+------------+-----------+------------------------+----------+
+                // | Header    | Payload (dataLength)   | Checksum Type (1 byte) | Checksum |
+                // +-----------+------------+-----------+------------------------+----------+
+                //             |                    (eventBodyLength)                       |
+                //             +------------------------------------------------------------+
+                FormatDescriptionEventData formatDescriptionEvent;
+                if (eventData instanceof EventDataWrapper) {
+                    EventDataWrapper eventDataWrapper = (EventDataWrapper) eventData;
+                    formatDescriptionEvent = (FormatDescriptionEventData) eventDataWrapper.getInternal();
+                    if (formatDescEventDataDeserializer != null) {
+                        eventData = eventDataWrapper.getExternal();
+                    }
+                } else {
+                    formatDescriptionEvent = (FormatDescriptionEventData) eventData;
+                }
+                checksumLength = formatDescriptionEvent.getChecksumType().getLength();
+            } finally {
+                inputStream.skipToTheEndOfTheBlock();
+            }
+        } catch (IOException e) {
+            throw new EventDataDeserializationException(eventHeader, e);
+        }
+        return eventData;
+    }
+
+    public EventData deserializeTransactionPayloadEventData(ByteArrayInputStream inputStream, EventHeader eventHeader)
+        throws IOException {
+        EventDataDeserializer eventDataDeserializer = eventDataDeserializers.get(EventType.TRANSACTION_PAYLOAD);
+        EventData eventData = deserializeEventData(inputStream, eventHeader, eventDataDeserializer);
+        TransactionPayloadEventData transactionPayloadEventData = (TransactionPayloadEventData) eventData;
+
+        /**
+         * Handling for TABLE_MAP events withing the transaction payload event. This is to ensure that for the table map
+         * events within the transaction payload, the target table id and the event gets added to the
+         * tableMapEventByTableId map. This is map is later used while deserializing rows.
+         */
+        for (Event event : transactionPayloadEventData.getUncompressedEvents()) {
+            if (event.getHeader().getEventType() == EventType.TABLE_MAP && event.getData() != null) {
+                TableMapEventData tableMapEvent = (TableMapEventData) event.getData();
+                tableMapEventByTableId.put(tableMapEvent.getTableId(), tableMapEvent);
+            }
+        }
+        return eventData;
+    }
+
+    public EventData deserializeTableMapEventData(ByteArrayInputStream inputStream, EventHeader eventHeader)
+            throws IOException {
+        EventDataDeserializer eventDataDeserializer =
+            tableMapEventDataDeserializer != null ?
+                tableMapEventDataDeserializer :
+                getEventDataDeserializer(EventType.TABLE_MAP);
+        EventData eventData = deserializeEventData(inputStream, eventHeader, eventDataDeserializer);
+        TableMapEventData tableMapEvent;
+        if (eventData instanceof EventDataWrapper) {
+            EventDataWrapper eventDataWrapper = (EventDataWrapper) eventData;
+            tableMapEvent = (TableMapEventData) eventDataWrapper.getInternal();
+            if (tableMapEventDataDeserializer != null) {
+                eventData = eventDataWrapper.getExternal();
+            }
+        } else {
+            tableMapEvent = (TableMapEventData) eventData;
+        }
+        tableMapEventByTableId.put(tableMapEvent.getTableId(), tableMapEvent);
+        return eventData;
     }
 
     private EventData deserializeEventData(ByteArrayInputStream inputStream, EventHeader eventHeader,
@@ -253,6 +354,7 @@ public class EventDeserializer {
      * @see CompatibilityMode#DATE_AND_TIME_AS_LONG
      * @see CompatibilityMode#DATE_AND_TIME_AS_LONG_MICRO
      * @see CompatibilityMode#INVALID_DATE_AND_TIME_AS_ZERO
+     * @see CompatibilityMode#INVALID_DATE_AND_TIME_AS_MIN_VALUE
      * @see CompatibilityMode#CHAR_AND_BINARY_AS_BYTE_ARRAY
      */
     public enum CompatibilityMode {
@@ -276,6 +378,8 @@ public class EventDeserializer {
         /**
          * Return -1 instead of null if year/month/day is 0.
          * Affects DATETIME/DATETIME_V2/DATE/TIME/TIME_V2.
+         *
+         * @deprecated
          */
         INVALID_DATE_AND_TIME_AS_NEGATIVE_ONE,
         /**
@@ -288,7 +392,11 @@ public class EventDeserializer {
          *
          * <p>This option is going to be enabled by default starting from mysql-binlog-connector-java@1.0.0.
          */
-        CHAR_AND_BINARY_AS_BYTE_ARRAY
+        CHAR_AND_BINARY_AS_BYTE_ARRAY,
+        /**
+         * Return TINY/SHORT/INT24/LONG/LONGLONG values as byte[]|s (instead of int|s).
+         */
+        INTEGER_AS_BYTE_ARRAY
     }
 
     /**
@@ -320,6 +428,12 @@ public class EventDeserializer {
             sb.append(", external=").append(external);
             sb.append('}');
             return sb.toString();
+        }
+
+        public static EventData internal(EventData eventData) {
+            return eventData instanceof EventDeserializer.EventDataWrapper ?
+                ((EventDeserializer.EventDataWrapper) eventData).getInternal() :
+                eventData;
         }
 
         /**

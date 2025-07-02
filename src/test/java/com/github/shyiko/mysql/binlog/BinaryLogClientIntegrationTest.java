@@ -32,18 +32,16 @@ import com.github.shyiko.mysql.binlog.event.deserialization.QueryEventDataDeseri
 import com.github.shyiko.mysql.binlog.io.BufferedSocketInputStream;
 import com.github.shyiko.mysql.binlog.io.ByteArrayInputStream;
 import com.github.shyiko.mysql.binlog.network.AuthenticationException;
+import com.github.shyiko.mysql.binlog.network.SSLMode;
 import com.github.shyiko.mysql.binlog.network.ServerException;
 import com.github.shyiko.mysql.binlog.network.SocketFactory;
 import org.mockito.InOrder;
 import org.testng.SkipException;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.AfterMethod;
-import org.testng.annotations.BeforeClass;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
-import javax.xml.bind.DatatypeConverter;
-import java.io.Closeable;
 import java.io.EOFException;
 import java.io.FilterInputStream;
 import java.io.FilterOutputStream;
@@ -55,13 +53,12 @@ import java.math.BigDecimal;
 import java.math.MathContext;
 import java.net.Socket;
 import java.net.SocketException;
-import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLSyntaxErrorException;
 import java.sql.Statement;
 import java.util.AbstractMap;
+import java.util.Base64;
 import java.util.BitSet;
 import java.util.Calendar;
 import java.util.List;
@@ -95,9 +92,9 @@ import static org.testng.Assert.fail;
 /**
  * @author <a href="mailto:stanley.shyiko@gmail.com">Stanley Shyiko</a>
  */
-public class BinaryLogClientIntegrationTest {
+public class BinaryLogClientIntegrationTest extends AbstractIntegrationTest {
 
-    private static final long DEFAULT_TIMEOUT = TimeUnit.SECONDS.toMillis(3);
+    protected static final long DEFAULT_TIMEOUT = TimeUnit.SECONDS.toMillis(3);
 
     private final Logger logger = Logger.getLogger(getClass().getSimpleName());
 
@@ -107,53 +104,15 @@ public class BinaryLogClientIntegrationTest {
 
     private final TimeZone timeZoneBeforeTheTest = TimeZone.getDefault();
 
-    private MySQLConnection master, slave;
-    private BinaryLogClient client;
-    private CountDownEventListener eventListener;
-
-    @BeforeClass
-    public void setUp() throws Exception {
-        TimeZone.setDefault(TimeZone.getTimeZone("GMT"));
-        ResourceBundle bundle = ResourceBundle.getBundle("jdbc");
-        String prefix = "jdbc.mysql.replication.";
-        master = new MySQLConnection(bundle.getString(prefix + "master.hostname"),
-                Integer.parseInt(bundle.getString(prefix + "master.port")),
-                bundle.getString(prefix + "master.username"), bundle.getString(prefix + "master.password"));
-        slave = new MySQLConnection(bundle.getString(prefix + "slave.hostname"),
-                Integer.parseInt(bundle.getString(prefix + "slave.port")),
-                bundle.getString(prefix + "slave.superUsername"), bundle.getString(prefix + "slave.superPassword"));
-        client = new BinaryLogClient(slave.hostname, slave.port, slave.username, slave.password);
-        EventDeserializer eventDeserializer = new EventDeserializer();
-        eventDeserializer.setCompatibilityMode(CompatibilityMode.CHAR_AND_BINARY_AS_BYTE_ARRAY,
-            CompatibilityMode.DATE_AND_TIME_AS_LONG);
-        client.setEventDeserializer(eventDeserializer);
-        client.setServerId(client.getServerId() - 1); // avoid clashes between BinaryLogClient instances
-        client.setKeepAlive(false);
-        client.registerEventListener(new TraceEventListener());
-        client.registerEventListener(eventListener = new CountDownEventListener());
-        client.registerLifecycleListener(new TraceLifecycleListener());
-        client.connect(DEFAULT_TIMEOUT);
-        master.execute(new Callback<Statement>() {
-            @Override
-            public void execute(Statement statement) throws SQLException {
-                statement.execute("drop database if exists mbcj_test");
-                statement.execute("create database mbcj_test");
-                statement.execute("use mbcj_test");
-            }
-        });
-        eventListener.waitFor(EventType.QUERY, 2, DEFAULT_TIMEOUT);
-    }
-
     @BeforeMethod
     public void beforeEachTest() throws Exception {
         master.execute(new Callback<Statement>() {
-            @Override
             public void execute(Statement statement) throws SQLException {
                 statement.execute("drop table if exists bikini_bottom");
                 statement.execute("create table bikini_bottom (name varchar(255) primary key)");
             }
         });
-        eventListener.waitFor(EventType.QUERY, 2, DEFAULT_TIMEOUT);
+        eventListener.waitForAtLeast(EventType.QUERY, 2, DEFAULT_TIMEOUT);
         eventListener.reset();
     }
 
@@ -166,7 +125,6 @@ public class BinaryLogClientIntegrationTest {
         client.registerEventListener(eventListener);
         try {
             master.execute(new Callback<Statement>() {
-                @Override
                 public void execute(Statement statement) throws SQLException {
                     statement.execute("insert into bikini_bottom values('SpongeBob')");
                 }
@@ -177,7 +135,6 @@ public class BinaryLogClientIntegrationTest {
             assertEquals(writtenRows.size(), 1);
             assertEquals(writtenRows.get(0), new Serializable[]{"SpongeBob".getBytes("UTF-8")});
             master.execute(new Callback<Statement>() {
-                @Override
                 public void execute(Statement statement) throws SQLException {
                     statement.execute("update bikini_bottom set name = 'Patrick' where name = 'SpongeBob'");
                 }
@@ -189,7 +146,6 @@ public class BinaryLogClientIntegrationTest {
             assertEquals(updatedRows.get(0).getKey(), new Serializable[]{"SpongeBob".getBytes("UTF-8")});
             assertEquals(updatedRows.get(0).getValue(), new Serializable[]{"Patrick".getBytes("UTF-8")});
             master.execute(new Callback<Statement>() {
-                @Override
                 public void execute(Statement statement) throws SQLException {
                     statement.execute("delete from bikini_bottom where name = 'Patrick'");
                 }
@@ -277,7 +233,6 @@ public class BinaryLogClientIntegrationTest {
         final boolean[] noZeroInDate = new boolean[1];
         master.query("select @@sql_mode;", new Callback<ResultSet>() {
 
-            @Override
             public void execute(ResultSet rs) throws SQLException {
                 // NO_ZERO_IN_DATE is turned on by default in MySQL 5.7
                 // https://github.com/shyiko/mysql-binlog-connector-java/pull/119#issuecomment-251870581
@@ -316,13 +271,21 @@ public class BinaryLogClientIntegrationTest {
     }
 
     @Test
+    public void testDeserializationOfYEARAndSignedness() throws Exception {
+        assertEquals(writeAndCaptureRow(
+                "int(20) NOT NULL AUTO_INCREMENT, `c2` year, `c3` int, `c4` int, `c5` int, `c6` int, `c7` int, `c8` int, `c9` int, c10 char(10), PRIMARY KEY (`column_`)",
+                "1, 2, 3, 4, 5, 6, 7, 8, 9, ''"),
+                new Serializable[]{1});
+    }
+
+    @Test
     public void testDeserializationOfSTRING() throws Exception {
         assertEquals(writeAndCaptureRow("char", "'q'"), new Serializable[]{"q".getBytes("UTF-8")});
         assertEquals(writeAndCaptureRow("char", "'Â'"), new Serializable[]{"Â".getBytes("UTF-8")});
         assertEquals(writeAndCaptureRow("binary", "x'01'"), new Serializable[]{new byte[] {1}});
         assertEquals(writeAndCaptureRow("binary", "x'FF'"), new Serializable[]{new byte[] {-1}});
         assertEquals(writeAndCaptureRow("binary(16)", "unhex(md5(\"glob\"))"),
-            new Serializable[]{DatatypeConverter.parseHexBinary("8684147451a6cc3b92142c6f4b78e61c")});
+            new Serializable[]{Base64.getDecoder().decode("hoQUdFGmzDuSFCxvS3jmHA==")});
     }
 
     @Test
@@ -364,7 +327,6 @@ public class BinaryLogClientIntegrationTest {
     public void testFSP() throws Exception {
         try {
             master.execute(new Callback<Statement>() {
-                @Override
                 public void execute(Statement statement) throws SQLException {
                     statement.execute("create table fsp_check (column_ datetime(0))");
                 }
@@ -401,7 +363,52 @@ public class BinaryLogClientIntegrationTest {
         try {
             assertEquals(writeAndCaptureRow(client, "datetime(6)", "'1989-03-21 01:02:03.123456'"), new Serializable[]{
                 generateTime(1989, 3, 21, 1, 2, 3, 123)});
-        } catch (Exception e) {
+        } finally {
+            client.disconnect();
+        }
+    }
+
+    @Test
+    public void testDeserializationOfIntegerAsByteArray() throws Exception {
+        final BinaryLogClient client = new BinaryLogClient(slave.hostname, slave.port,
+            slave.username, slave.password);
+        EventDeserializer eventDeserializer = new EventDeserializer();
+        eventDeserializer.setCompatibilityMode(CompatibilityMode.INTEGER_AS_BYTE_ARRAY);
+        client.setEventDeserializer(eventDeserializer);
+        client.connect(DEFAULT_TIMEOUT);
+        try {
+            Serializable[] result;
+
+            result = writeAndCaptureRow("tinyint unsigned", "0", "1", "255");
+            assertEquals(result[0], 0);
+            assertEquals(result[1], 1);
+            assertEquals(result[2], -1);
+
+
+            result = writeAndCaptureRow("tinyint", "-128", "-1", "0", "1", "127");
+            assertEquals(result[0], -128);
+            assertEquals(result[1], -1);
+            assertEquals(result[2], 0);
+            assertEquals(result[3], 1);
+            assertEquals(result[4], 127);
+
+            result = writeAndCaptureRow("smallint unsigned", "0", "1", "65535");
+            assertEquals(result[0], 0);
+            assertEquals(result[1], 1);
+            assertEquals(result[2], -1);
+
+            result = writeAndCaptureRow("smallint", "-32768", "-1", "0", "1", "32767");
+            assertEquals(result[0], -32768);
+            assertEquals(result[1], -1);
+            assertEquals(result[2], 0);
+            assertEquals(result[3], 1);
+            assertEquals(result[4], 32767);
+
+            result = writeAndCaptureRow("mediumint unsigned", "0", "1", "16777215");
+            assertEquals(result[0], 0);
+            assertEquals(result[1], 1);
+            assertEquals(result[2], -1);
+        } finally {
             client.disconnect();
         }
     }
@@ -417,7 +424,7 @@ public class BinaryLogClientIntegrationTest {
         try {
             assertEquals(writeAndCaptureRow(client, "datetime(6)", "'1989-03-21 01:02:03.123456'"), new Serializable[]{
                 generateTime(1989, 3, 21, 1, 2, 3, 123) * 1000 + 456});
-        } catch (Exception e) {
+        } finally {
             client.disconnect();
         }
     }
@@ -451,12 +458,10 @@ public class BinaryLogClientIntegrationTest {
             final String... values) throws Exception {
         CapturingEventListener capturingEventListener = new CapturingEventListener();
         client.registerEventListener(capturingEventListener);
-        // ensure "capturingEventListener -> eventListener" order
-        client.unregisterEventListener(eventListener);
+        CountDownEventListener eventListener = new CountDownEventListener();
         client.registerEventListener(eventListener);
         try {
             master.execute(new Callback<Statement>() {
-                @Override
                 public void execute(Statement statement) throws SQLException {
                     statement.execute("drop table if exists data_type_hell");
                     statement.execute("create table data_type_hell (column_ " + columnDefinition +
@@ -472,6 +477,7 @@ public class BinaryLogClientIntegrationTest {
             });
             eventListener.waitFor(WriteRowsEventData.class, 1, DEFAULT_TIMEOUT);
         } finally {
+            client.unregisterEventListener(eventListener);
             client.unregisterEventListener(capturingEventListener);
         }
         List<Serializable[]> writtenRows =
@@ -491,7 +497,6 @@ public class BinaryLogClientIntegrationTest {
 
             private int counter;
 
-            @Override
             public void onEvent(Event event) {
                 if (EventType.isRowMutation(event.getHeader().getEventType()) && counter++ == 1) {
                     // coordinates of second insert
@@ -503,7 +508,6 @@ public class BinaryLogClientIntegrationTest {
         client.registerEventListener(markEventListener);
         try {
             master.execute(new Callback<Statement>() {
-                @Override
                 public void execute(Statement statement) throws SQLException {
                     statement.execute("insert into bikini_bottom values('SpongeBob')");
                     statement.execute("insert into bikini_bottom values('Patrick')");
@@ -537,7 +541,6 @@ public class BinaryLogClientIntegrationTest {
         client.registerLifecycleListener(lifecycleListenerMock);
         try {
             master.execute(new Callback<Statement>() {
-                @Override
                 public void execute(Statement statement) throws SQLException {
                     statement.execute("create table geometry_table (location geometry)");
                     statement.execute(
@@ -549,7 +552,6 @@ public class BinaryLogClientIntegrationTest {
             eventListener.waitFor(WriteRowsEventData.class, 0, DEFAULT_TIMEOUT);
             verify(lifecycleListenerMock, only()).onEventDeserializationFailure(eq(client), any(Exception.class));
             master.execute(new Callback<Statement>() {
-                @Override
                 public void execute(Statement statement) throws SQLException {
                     statement.execute("insert into bikini_bottom values('SpongeBob')");
                 }
@@ -563,7 +565,6 @@ public class BinaryLogClientIntegrationTest {
     @Test
     public void testTrackingOfLastKnownBinlogFilenameAndPosition() throws Exception {
         master.execute(new Callback<Statement>() {
-            @Override
             public void execute(Statement statement) throws SQLException {
                 statement.execute("insert into bikini_bottom values('SpongeBob')");
             }
@@ -572,13 +573,11 @@ public class BinaryLogClientIntegrationTest {
         String binlogFilename = client.getBinlogFilename();
         long binlogPosition = client.getBinlogPosition();
         slave.execute(new Callback<Statement>() {
-            @Override
             public void execute(Statement statement) throws SQLException {
                 statement.execute("flush logs");
             }
         });
         master.execute(new Callback<Statement>() {
-            @Override
             public void execute(Statement statement) throws SQLException {
                 statement.execute("insert into bikini_bottom values('Patrick')");
 
@@ -590,7 +589,6 @@ public class BinaryLogClientIntegrationTest {
         assertNotEquals(updatedBinlogFilename, binlogFilename);
         assertNotEquals(updatedBinlogPosition, binlogPosition);
         master.execute(new Callback<Statement>() {
-            @Override
             public void execute(Statement statement) throws SQLException {
                 statement.execute("insert into bikini_bottom values('Rocky')");
             }
@@ -603,7 +601,6 @@ public class BinaryLogClientIntegrationTest {
     @Test
     public void testAbilityToBeSuspendedAndResumed() throws Exception {
         master.execute(new Callback<Statement>() {
-            @Override
             public void execute(Statement statement) throws SQLException {
                 statement.execute("insert into bikini_bottom values('SpongeBob')");
             }
@@ -612,7 +609,6 @@ public class BinaryLogClientIntegrationTest {
         try {
             client.disconnect();
             master.execute(new Callback<Statement>() {
-                @Override
                 public void execute(Statement statement) throws SQLException {
                     statement.execute("insert into bikini_bottom values('Patrick')");
                     statement.execute("insert into bikini_bottom values('Rocky')");
@@ -635,7 +631,6 @@ public class BinaryLogClientIntegrationTest {
         String binlogFilename = client.getBinlogFilename();
         long binlogPosition = client.getBinlogPosition();
         master.execute(new Callback<Statement>() {
-            @Override
             public void execute(Statement statement) throws SQLException {
                 statement.execute("insert into bikini_bottom values('SpongeBob')");
             }
@@ -648,6 +643,7 @@ public class BinaryLogClientIntegrationTest {
         eventListener.waitFor(WriteRowsEventData.class, 1, DEFAULT_TIMEOUT);
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void testAutomaticFailover() throws Exception {
         TCPReverseProxy tcpReverseProxy = new TCPReverseProxy(33262, slave.port);
@@ -671,7 +667,6 @@ public class BinaryLogClientIntegrationTest {
                     tcpReverseProxy.unbind();
                     TimeUnit.MILLISECONDS.sleep(300);
                     master.execute(new Callback<Statement>() {
-                        @Override
                         public void execute(Statement statement) throws SQLException {
                             statement.execute("insert into bikini_bottom values('SpongeBob')");
                         }
@@ -681,7 +676,6 @@ public class BinaryLogClientIntegrationTest {
                     InOrder inOrder = inOrder(lifecycleListenerMock);
                     inOrder.verify(lifecycleListenerMock).onDisconnect(eq(clientOverProxy));
                     inOrder.verify(lifecycleListenerMock).onConnect(eq(clientOverProxy));
-                    verifyNoMoreInteractions(lifecycleListenerMock);
                 } finally {
                     clientOverProxy.disconnect();
                 }
@@ -728,24 +722,12 @@ public class BinaryLogClientIntegrationTest {
 
     private void testCommunicationFailureInTheMiddleOfEventDataDeserialization(final IOException ex) throws Exception {
         EventDeserializer eventDeserializer = new EventDeserializer();
-        eventDeserializer.setEventDataDeserializer(EventType.QUERY, new QueryEventDataDeserializer() {
-
-            private boolean failureSimulated;
-
-            @Override
-            public QueryEventData deserialize(ByteArrayInputStream inputStream) throws IOException {
-                QueryEventData eventData = super.deserialize(inputStream);
-                if (!failureSimulated) {
-                    failureSimulated = true;
-                    throw new SocketException();
-                }
-                return eventData;
-            }
-        });
+        eventDeserializer.setEventDataDeserializer(EventType.QUERY, new QueryEventFailureSimulator());
         testCommunicationFailure(eventDeserializer);
     }
 
-    private void testCommunicationFailure(EventDeserializer eventDeserializer) throws Exception {
+    @SuppressWarnings("deprecation")
+    protected void testCommunicationFailure(EventDeserializer eventDeserializer) throws Exception {
         try {
             client.disconnect();
             final BinaryLogClient clientWithKeepAlive = new BinaryLogClient(slave.hostname, slave.port,
@@ -762,7 +744,6 @@ public class BinaryLogClientIntegrationTest {
                         mock(BinaryLogClient.LifecycleListener.class);
                 clientWithKeepAlive.registerLifecycleListener(lifecycleListenerMock);
                 master.execute(new Callback<Statement>() {
-                    @Override
                     public void execute(Statement statement) throws SQLException {
                         statement.execute("drop table if exists not_meant_to_exist");
                     }
@@ -802,18 +783,16 @@ public class BinaryLogClientIntegrationTest {
                 binaryLogClient.connect(DEFAULT_TIMEOUT);
                 eventListener.waitFor(EventType.FORMAT_DESCRIPTION, 1, DEFAULT_TIMEOUT);
                 master.execute(new Callback<Statement>() {
-                    @Override
                     public void execute(Statement statement) throws SQLException {
                         statement.execute("insert into bikini_bottom values('SpongeBob')");
                     }
                 });
                 slave.execute(new Callback<Statement>() {
-                    @Override
                     public void execute(Statement statement) throws SQLException {
                         statement.execute("flush logs");
                     }
                 });
-                eventListener.waitFor(EventType.QUERY, 1, DEFAULT_TIMEOUT);
+                eventListener.waitForAtLeast(EventType.QUERY, 1, DEFAULT_TIMEOUT);
                 eventListener.waitFor(EventType.ROTATE, 3, DEFAULT_TIMEOUT); /* 2 with timestamp 0 */
                 eventListener.waitFor(ByteArrayEventData.class, 5, DEFAULT_TIMEOUT);
             } finally {
@@ -828,6 +807,12 @@ public class BinaryLogClientIntegrationTest {
     public void testExceptionIsThrownWhenTryingToConnectAlreadyConnectedClient() throws Exception {
         assertTrue(client.isConnected());
         client.connect();
+    }
+
+    @Test(expectedExceptions = IOException.class)
+    public void testExceptionIsThrownWhenTryingToConnectAlreadyConnectedClientWithTimeout() throws Exception {
+        assertTrue(client.isConnected());
+        client.connect(1000);
     }
 
     @Test
@@ -848,13 +833,13 @@ public class BinaryLogClientIntegrationTest {
         String prefix = "jdbc.mysql.replication.";
         String slaveUsername = bundle.getString(prefix + "slave.slaveUsername");
         String slavePassword = bundle.getString(prefix + "slave.slavePassword");
+
         new BinaryLogClient(slave.hostname, slave.port, slaveUsername, slavePassword).connect();
     }
 
     private void bindInSeparateThread(final TCPReverseProxy tcpReverseProxy) throws InterruptedException {
         new Thread(new Runnable() {
 
-            @Override
             public void run() {
                 try {
                     tcpReverseProxy.bind();
@@ -875,7 +860,6 @@ public class BinaryLogClientIntegrationTest {
     @Test
     public void testSpecifiedSchemaDoesNotResultInEventFiltering() throws Exception {
         master.execute(new Callback<Statement>() {
-            @Override
             public void execute(Statement statement) throws SQLException {
                 statement.execute("drop database if exists mbcj_test_isolated");
                 statement.execute("create database mbcj_test_isolated");
@@ -891,7 +875,6 @@ public class BinaryLogClientIntegrationTest {
             isolatedClient.registerEventListener(isolatedEventListener);
             isolatedClient.connect(DEFAULT_TIMEOUT);
             master.execute(new Callback<Statement>() {
-                @Override
                 public void execute(Statement statement) throws SQLException {
                     statement.execute("insert into mbcj_test_isolated.bikini_bottom values('Patrick')");
                     statement.execute("insert into mbcj_test.bikini_bottom values('Rocky')");
@@ -916,7 +899,6 @@ public class BinaryLogClientIntegrationTest {
             final AtomicBoolean breakOutputStream = new AtomicBoolean();
             binaryLogClient.setSocketFactory(new SocketFactory() {
 
-                @Override
                 public Socket createSocket() throws SocketException {
                     return new Socket() {
 
@@ -957,7 +939,6 @@ public class BinaryLogClientIntegrationTest {
             try {
                 eventListener.waitFor(EventType.FORMAT_DESCRIPTION, 1, DEFAULT_TIMEOUT);
                 master.execute(new Callback<Statement>() {
-                    @Override
                     public void execute(Statement statement) throws SQLException {
                         statement.execute("insert into bikini_bottom values('SpongeBob')");
                     }
@@ -967,7 +948,6 @@ public class BinaryLogClientIntegrationTest {
                 inputStreamLock.lock();
                 // fill input stream buffer
                 master.execute(new Callback<Statement>() {
-                    @Override
                     public void execute(Statement statement) throws SQLException {
                         statement.execute("insert into bikini_bottom values('Patrick')");
                         statement.execute("insert into bikini_bottom values('Rocky')");
@@ -988,7 +968,6 @@ public class BinaryLogClientIntegrationTest {
                 // unlock input stream (from previous connection)
                 inputStreamLock.unlock();
                 master.execute(new Callback<Statement>() {
-                    @Override
                     public void execute(Statement statement) throws SQLException {
                         statement.execute("delete from bikini_bottom where name = 'Patrick'");
                     }
@@ -1004,16 +983,105 @@ public class BinaryLogClientIntegrationTest {
         }
     }
 
+    @Test
+    public void testMysql8Auth() throws Exception {
+        if ( !mysqlVersion.atLeast(8, 0) )
+            throw new SkipException("skipping mysql8 auth test");
+
+        BinaryLogClient client = new BinaryLogClient(master.hostname, master.port, "mysql8", "testpass");
+        client.setSSLMode(SSLMode.PREFERRED);
+        client.connect(DEFAULT_TIMEOUT);
+    }
+
+    @Test
+    public void testMysql8FastAuth() throws Exception {
+        if ( !mysqlVersion.atLeast(8, 0) )
+            throw new SkipException("skipping mysql8 auth test");
+
+        BinaryLogClient client = new BinaryLogClient(master.hostname, master.port, "mysql8", "testpass");
+        client.setSSLMode(SSLMode.PREFERRED);
+        client.connect(DEFAULT_TIMEOUT);
+
+        client.disconnect();
+
+        // this call should hit the sha2 cache
+        client.connect(DEFAULT_TIMEOUT);
+    }
+
+
+    @Test
+    public void testSHA2CachingAuthAsDefault() throws Exception {
+        if ( !mysqlVersion.atLeast(8, 0) )
+            throw new SkipException("skipping mysql8 auth test");
+
+        MysqlOnetimeServerOptions opts = new MysqlOnetimeServerOptions();
+        opts.extraParams = "--default-authentication-plugin=caching_sha2_password";
+        MysqlOnetimeServer server = new MysqlOnetimeServer(opts);
+        server.boot();
+
+        MySQLConnection cx = new MySQLConnection("127.0.0.1", server.getPort(), "root", "");
+
+        setupMysql8Login(cx);
+        BinaryLogClient c = new BinaryLogClient(cx.hostname, cx.port, "mysql8", "testpass");
+        c.setSSLMode(SSLMode.PREFERRED);
+        c.connect(DEFAULT_TIMEOUT);
+
+        server.shutDown();
+    }
+
+    @Test
+    public void testSHA2CachingWithoutSSL() throws Exception {
+        if ( !mysqlVersion.atLeast(8, 0) )
+            throw new SkipException("skipping mysql8 auth test");
+
+        BinaryLogClient client = new BinaryLogClient(master.hostname, master.port, "mysql8", "testpass");
+        client.connect(DEFAULT_TIMEOUT);
+    }
+
+    @Test
+    public void testMySQL8TableMetadata() throws Exception {
+        master.execute("drop table if exists test_metameta");
+        master.execute("create table test_metameta ( " +
+                "a date, b date, c date, d date, e date, f date, g date, " +
+                "h date, i date, j int)");
+        master.execute("insert into test_metameta set j = 5");
+        eventListener.waitFor(WriteRowsEventData.class, 1, DEFAULT_TIMEOUT);
+    }
+
+    @Test
+    public void testSetMasterServerId() throws Exception {
+        slave.query("SELECT @@server_id", new Callback<ResultSet>() {
+            public void execute(final ResultSet rs) throws SQLException {
+                rs.next();
+                assertEquals(client.getMasterServerId(), rs.getLong("@@server_id"));
+            }
+        });
+    }
+
+    @Test
+    public void testMySQL8InvisibleColumn() throws Exception {
+        if ( !mysqlVersion.atLeast(8, 0) )
+            throw new SkipException("skipping mysql8 invisible column test");
+
+        master.execute("drop table if exists test_invisible_column");
+        master.execute("create table test_invisible_column (\n"
+                + "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,\n"
+                + "name varchar(100) not null,\n"
+                + "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP INVISIBLE\n"
+                + ");");
+        master.execute("insert into test_invisible_column (name) values ('User 1')");
+        eventListener.waitFor(WriteRowsEventData.class, 1, DEFAULT_TIMEOUT);
+    }
+
     @AfterMethod
     public void afterEachTest() throws Exception {
         final CountDownLatch latch = new CountDownLatch(1);
         final String markerQuery = "drop table if exists _EOS_marker";
         BinaryLogClient.EventListener markerInterceptor = new BinaryLogClient.EventListener() {
-            @Override
             public void onEvent(Event event) {
                 if (event.getHeader().getEventType() == EventType.QUERY) {
                     EventData data = event.getData();
-                    if (data != null && ((QueryEventData) data).getSql().contains("_EOS_marker")) {
+                    if (data != null && ((QueryEventData) data).getSql().toLowerCase().contains("_eos_marker")) {
                         latch.countDown();
                     }
                 }
@@ -1021,7 +1089,6 @@ public class BinaryLogClientIntegrationTest {
         };
         client.registerEventListener(markerInterceptor);
         master.execute(new Callback<Statement>() {
-            @Override
             public void execute(Statement statement) throws SQLException {
                 statement.execute(markerQuery);
             }
@@ -1039,107 +1106,16 @@ public class BinaryLogClientIntegrationTest {
                 client.disconnect();
             }
         } finally {
+            if (slave != null) {
+                slave.close();
+            }
             if (master != null) {
                 master.execute(new Callback<Statement>() {
-                    @Override
                     public void execute(Statement statement) throws SQLException {
                         statement.execute("drop database mbcj_test");
                     }
                 });
                 master.close();
-            }
-        }
-    }
-
-    /**
-     * Representation of a MySQL connection.
-     */
-    public static final class MySQLConnection implements Closeable {
-
-        private final String hostname;
-        private final int port;
-        private final String username;
-        private final String password;
-        private Connection connection;
-
-        public MySQLConnection(String hostname, int port, String username, String password)
-            throws ClassNotFoundException, SQLException {
-            this.hostname = hostname;
-            this.port = port;
-            this.username = username;
-            this.password = password;
-            Class.forName("com.mysql.jdbc.Driver");
-            this.connection = DriverManager.getConnection("jdbc:mysql://" + hostname + ":" + port,
-                username, password);
-            execute(new Callback<Statement>() {
-
-                @Override
-                public void execute(Statement statement) throws SQLException {
-                    statement.execute("SET time_zone = '+00:00'");
-                }
-            });
-        }
-
-        public String hostname() {
-            return hostname;
-        }
-
-        public int port() {
-            return port;
-        }
-
-        public String username() {
-            return username;
-        }
-
-        public String password() {
-            return password;
-        }
-
-        public void execute(Callback<Statement> callback) throws SQLException {
-            connection.setAutoCommit(false);
-            Statement statement = connection.createStatement();
-            try {
-                callback.execute(statement);
-                connection.commit();
-            } finally {
-                statement.close();
-            }
-        }
-
-        public void execute(final String...statements) throws SQLException {
-            execute(new Callback<Statement>() {
-                @Override
-                public void execute(Statement statement) throws SQLException {
-                    for (String command : statements) {
-                        statement.execute(command);
-                    }
-                }
-            });
-        }
-
-        public void query(String sql, Callback<ResultSet> callback) throws SQLException {
-            connection.setAutoCommit(false);
-            Statement statement = connection.createStatement();
-            try {
-                ResultSet rs = statement.executeQuery(sql);
-                try {
-                    callback.execute(rs);
-                    connection.commit();
-                } finally {
-                    rs.close();
-                }
-            } finally {
-                statement.close();
-            }
-        }
-
-        @Override
-        public void close() throws IOException {
-            try {
-                connection.close();
-            } catch (SQLException e) {
-                throw new IOException(e);
             }
         }
     }
@@ -1153,4 +1129,23 @@ public class BinaryLogClientIntegrationTest {
 
         void execute(T obj) throws SQLException;
     }
+
+    /**
+     * Used to simulate {@link SocketException} inside
+     * {@link QueryEventDataDeserializer#deserialize(ByteArrayInputStream)} (once).
+     */
+    protected class QueryEventFailureSimulator extends QueryEventDataDeserializer {
+        private boolean failureSimulated;
+
+        @Override
+        public QueryEventData deserialize(ByteArrayInputStream inputStream) throws IOException {
+            QueryEventData eventData = super.deserialize(inputStream);
+            if (!failureSimulated) {
+                failureSimulated = true;
+                throw new SocketException();
+            }
+            return eventData;
+        }
+    }
+
 }

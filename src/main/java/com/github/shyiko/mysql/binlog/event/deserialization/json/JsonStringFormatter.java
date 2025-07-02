@@ -19,6 +19,7 @@ import com.github.shyiko.mysql.binlog.event.deserialization.ColumnType;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.util.Base64;
 
 /**
  * A {@link JsonFormatter} implementation that creates a JSON string representation.
@@ -67,7 +68,19 @@ public class JsonStringFormatter implements JsonFormatter {
 
     private static final char[] HEX_CODES = "0123456789ABCDEF".toCharArray();
 
-    private final StringBuilder sb = new StringBuilder();
+    private final StringBuilder sb;
+
+    public JsonStringFormatter() {
+        this.sb = new StringBuilder();
+    }
+
+    /**
+     * Constructs a JsonFormatter with the given initial capacity.
+     * @param capacity the initial capacity. Should be a positive number.
+     */
+    public JsonStringFormatter(int capacity) {
+        this.sb = new StringBuilder(capacity);
+    }
 
     @Override
     public String toString() {
@@ -114,12 +127,12 @@ public class JsonStringFormatter implements JsonFormatter {
 
     @Override
     public void value(int value) {
-        sb.append(Integer.toString(value));
+        sb.append(value);
     }
 
     @Override
     public void value(long value) {
-        sb.append(Long.toString(value));
+        sb.append(value);
     }
 
     @Override
@@ -197,7 +210,7 @@ public class JsonStringFormatter implements JsonFormatter {
     @Override
     public void valueOpaque(ColumnType type, byte[] value) {
         sb.append('"');
-        sb.append(javax.xml.bind.DatatypeConverter.printBase64Binary(value));
+        sb.append(Base64.getEncoder().encodeToString(value));
         sb.append('"');
     }
 
