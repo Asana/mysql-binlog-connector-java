@@ -860,12 +860,13 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     }
 
     private void spawnKeepAliveThread() {
+        final String keepAliveThreadName = "blc-keepalive-" + hostname + ":" + port;
         final ExecutorService threadExecutor =
             Executors.newSingleThreadExecutor(new ThreadFactory() {
 
                 @Override
                 public Thread newThread(Runnable runnable) {
-                    return newNamedThread(runnable, "blc-keepalive-" + hostname + ":" + port);
+                    return newNamedThread(runnable, keepAliveThreadName);
                 }
             });
         try {
@@ -1333,13 +1334,6 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                 return;
             }
             localExecutor.shutdownNow();
-            // Null the field while holding the lock so the executor becomes unreachable from this
-            // BinaryLogClient instance. Without this, the JVM Cleaner's PhantomCleanableRef for
-            // the executor can never fire: the Cleaner's own activeList holds a strong reference
-            // to the cleanup action lambda, which captures ThreadPoolExecutor, whose threadFactory
-            // is a BinaryLogClient inner class that captures `this`, which holds keepAliveThreadExecutor
-            // — a cycle that prevents the executor from ever becoming phantom-reachable.
-            this.keepAliveThreadExecutor = null;
         } finally {
             keepAliveThreadExecutorLock.unlock();
         }
