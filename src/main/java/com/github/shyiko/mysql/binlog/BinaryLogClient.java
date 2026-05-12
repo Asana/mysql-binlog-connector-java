@@ -860,14 +860,10 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     }
 
     private void spawnKeepAliveThread() {
+        final String keepAliveThreadName = "blc-keepalive-" + hostname + ":" + port;
         final ExecutorService threadExecutor =
-            Executors.newSingleThreadExecutor(new ThreadFactory() {
-
-                @Override
-                public Thread newThread(Runnable runnable) {
-                    return newNamedThread(runnable, "blc-keepalive-" + hostname + ":" + port);
-                }
-            });
+            Executors.newSingleThreadExecutor(
+                new KeepAliveThreadFactory(this.threadFactory, keepAliveThreadName));
         try {
             keepAliveThreadExecutorLock.lock();
             threadExecutor.submit(new Runnable() {
@@ -1435,6 +1431,33 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
 
         public void onDisconnect(BinaryLogClient client) { }
 
+    }
+
+    /**
+     * Static so it cannot capture {@code BinaryLogClient.this}. An anonymous or non-static inner
+     * class declared in instance context implicitly captures the enclosing instance via a synthetic
+     * {@code this$0} field (JLS §15.9.5), regardless of whether the body references instance
+     * members. The JDK Cleaner registered by {@code AutoShutdownDelegatedExecutorService} holds
+     * the {@code ThreadPoolExecutor}, which holds its {@code threadFactory}. If that factory
+     * transitively reaches the executor (the Cleaner's referent), the referent is never
+     * phantom-reachable and the Cleaner action never runs, leaking ~1.6 MB per
+     * {@code BinaryLogClient} lifecycle.
+     */
+    private static final class KeepAliveThreadFactory implements ThreadFactory {
+        private final ThreadFactory delegate;
+        private final String threadName;
+
+        KeepAliveThreadFactory(ThreadFactory delegate, String threadName) {
+            this.delegate = delegate;
+            this.threadName = threadName;
+        }
+
+        @Override
+        public Thread newThread(Runnable runnable) {
+            Thread thread = delegate == null ? new Thread(runnable) : delegate.newThread(runnable);
+            thread.setName(threadName);
+            return thread;
+        }
     }
 
 }
