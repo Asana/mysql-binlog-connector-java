@@ -1321,22 +1321,17 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     }
 
     private void terminateKeepAliveThread() {
-        ExecutorService localExecutor;
         try {
             keepAliveThreadExecutorLock.lock();
-            localExecutor = this.keepAliveThreadExecutor;
-            if ( localExecutor == null ) {
+            ExecutorService keepAliveThreadExecutor = this.keepAliveThreadExecutor;
+            if ( keepAliveThreadExecutor == null ) {
                 return;
             }
-            localExecutor.shutdownNow();
-            // Belt-and-suspenders: null the field so BinaryLogClient no longer strongly
-            // holds the executor after disconnect, even if a future refactor reintroduces
-            // an outer capture in KeepAliveThreadFactory.
-            this.keepAliveThreadExecutor = null;
+            keepAliveThreadExecutor.shutdownNow();
         } finally {
             keepAliveThreadExecutorLock.unlock();
         }
-        while (!awaitTerminationInterruptibly(localExecutor,
+        while (!awaitTerminationInterruptibly(keepAliveThreadExecutor,
             Long.MAX_VALUE, TimeUnit.NANOSECONDS)) {
             // ignore
         }
