@@ -860,10 +860,9 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     }
 
     private void spawnKeepAliveThread() {
-        final String keepAliveThreadName = "blc-keepalive-" + hostname + ":" + port;
         final ExecutorService threadExecutor =
             Executors.newSingleThreadExecutor(
-                new KeepAliveThreadFactory(threadFactory, keepAliveThreadName));
+                new KeepAliveThreadFactory(threadFactory, "blc-keepalive-" + hostname + ":" + port));
         try {
             keepAliveThreadExecutorLock.lock();
             threadExecutor.submit(new Runnable() {
