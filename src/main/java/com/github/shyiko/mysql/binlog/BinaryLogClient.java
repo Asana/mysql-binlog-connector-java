@@ -867,8 +867,8 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                 public Thread newThread(Runnable runnable) {
                     return newNamedThread(runnable, "blc-keepalive-" + hostname + ":" + port);
                 }
-            });        
-	try {
+            });
+        try {
             keepAliveThreadExecutorLock.lock();
             threadExecutor.submit(new Runnable() {
                 @Override
