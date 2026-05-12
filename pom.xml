@@ -4,7 +4,7 @@
 
     <groupId>com.github.asana</groupId>
     <artifactId>mysql-binlog-connector-java-asana-fork</artifactId>
-    <version>0.30.3</version>
+    <version>0.30.4</version>
 
     <name>mysql-binlog-connector-java</name>
     <description>MySQL Binary Log connector</description>
